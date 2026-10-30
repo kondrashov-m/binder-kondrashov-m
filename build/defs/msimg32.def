@@ -1,0 +1,3 @@
+LIBRARY msimg32.dll
+EXPORTS
+  GradientFill@24

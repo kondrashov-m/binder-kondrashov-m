@@ -1,0 +1,13 @@
+# сборка
+out/
+*.o
+*.obj
+*.lib
+*.res
+
+# личные данные программы (создаются рядом с exe)
+rtbind_data.txt
+rtbind_data.tmp
+rtbind_history.txt
+rtbind_settings.txt
+binds/

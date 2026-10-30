@@ -1,0 +1,27 @@
+1 ICON "rtbind.ico"
+1 24 "rtbind.manifest"
+1 VERSIONINFO
+FILEVERSION 3,0,0,0
+PRODUCTVERSION 3,0,0,0
+FILEOS 0x4
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "kondrashov-m"
+      VALUE "FileDescription", "BINDER - tickets and hotkey binds"
+      VALUE "FileVersion", "3.0.0.0"
+      VALUE "InternalName", "RTBind"
+      VALUE "LegalCopyright", "(c) kondrashov-m, kondrashov-m.ru"
+      VALUE "OriginalFilename", "RTBind.exe"
+      VALUE "ProductName", "BINDER by kondrashov-m"
+      VALUE "ProductVersion", "3.0.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
