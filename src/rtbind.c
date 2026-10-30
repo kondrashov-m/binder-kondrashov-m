@@ -53,7 +53,7 @@ static void unix_local(DWORD u, SYSTEMTIME *st) {
 /* ---------------- данные ---------------- */
 #define MAXT 400
 typedef struct {
-  int status;               /* 0 — в работе, 1 — выполнена */
+  int status;               /* 0 — в работе, 1 — выполнена, 2 — на уточнении (runStart = с какого момента) */
   DWORD order, elapsed, runStart, created, doneAt;
   WCHAR num[32];
   WCHAR note[120];
@@ -147,7 +147,7 @@ static void load_data(void) {
     parse_s(&p, t->num, 32); parse_s(&p, t->note, 120);
     while (*p && *p != '\n') p++; if (*p) p++;
     if (!t->num[0]) continue;
-    if (t->status != 1) t->status = 0;
+    if (t->status != 1 && t->status != 2) t->status = 0;
     /* время в работе = накопленное + (текущее системное время - момент запуска таймера);
        программа может быть закрыта — таймер всё равно идёт */
     if (t->status == 0 && (t->runStart == 0 || t->runStart > now)) t->runStart = now;
@@ -184,14 +184,17 @@ static HCURSOR curArrow, curHand;
 #define C_GREEN RGB(100, 245, 210)
 #define C_RED RGB(255, 92, 110)
 
-static int g_scroll[2];
+static int g_scroll[3];
+#define C_AMB RGB(255, 181, 71)
+static int col_of(int st) { return st == 0 ? 0 : st == 2 ? 1 : 2; }
+static const int COL_ST[3] = {0, 2, 1};
 static int g_focusNum, g_focusNote;
 static int g_hkOk;
 static WCHAR g_toast[160];
 static DWORD g_toastUntil;
 
 /* hover / press */
-enum { H_NONE, H_ADD, H_BINDS, H_CLEAR, H_CARD, H_CARD_B1, H_CARD_B2, H_SITE, H_REMIND };
+enum { H_NONE, H_ADD, H_BINDS, H_CLEAR, H_CARD, H_CARD_B1, H_CARD_B2, H_CARD_B3, H_SITE, H_REMIND };
 typedef struct { int kind, idx; } Hit;
 static Hit g_hover, g_press;
 static int g_dragging, g_dragIdx, g_dragDX, g_dragDY;
@@ -200,6 +203,7 @@ static int g_tracking;
 
 static void open_edit(int i);
 static void open_settings(void);
+static void set_status(int i, int st);
 static void remind_tick(void);
 static int g_remOn = 1, g_remH = 19, g_remM = 30;
 static HWND g_ew;
@@ -264,16 +268,16 @@ static void fmt_clock(DWORD u, WCHAR *out) { SYSTEMTIME st; unix_local(u, &st); 
 typedef struct {
   int W, H, M;
   RECT header, numBox, noteBox, addBtn, bindsBtn, remindBtn, site;
-  RECT col[2], area[2], clearBtn;
+  RECT col[3], area[3], clearBtn;
   int cardH, gap;
-  int idx[2][MAXT], cnt[2];
+  int idx[3][MAXT], cnt[3];
 } Layout;
 static Layout L;
 
 static void build_lists(void) {
-  L.cnt[0] = L.cnt[1] = 0;
+  L.cnt[0] = L.cnt[1] = L.cnt[2] = 0;
   for (int i = 0; i < NT; i++) {
-    int c = T[i].status ? 1 : 0, k = L.cnt[c]++;
+    int c = col_of(T[i].status), k = L.cnt[c]++;
     while (k > 0 && T[L.idx[c][k - 1]].order < T[i].order) { L.idx[c][k] = L.idx[c][k - 1]; k--; }
     L.idx[c][k] = i;
   }
@@ -291,16 +295,16 @@ static void do_layout(void) {
   L.numBox = (RECT){M, y, M + S(210), y + h};
   L.noteBox = (RECT){M + S(222), y, L.addBtn.left - S(12), y + h};
   int top = y + h + S(20), bottom = H - S(44);
-  int cw = (W - 2 * M - S(18)) / 2;
-  L.col[0] = (RECT){M, top, M + cw, bottom};
-  L.col[1] = (RECT){W - M - cw, top, W - M, bottom};
-  for (int c = 0; c < 2; c++)
+  int gapc = S(16), cw = (W - 2 * M - 2 * gapc) / 3;
+  for (int c = 0; c < 3; c++) L.col[c] = (RECT){M + c * (cw + gapc), top, M + c * (cw + gapc) + cw, bottom};
+  L.col[2].right = W - M;
+  for (int c = 0; c < 3; c++)
     L.area[c] = (RECT){L.col[c].left + S(14), L.col[c].top + S(62), L.col[c].right - S(14), L.col[c].bottom - S(12)};
-  L.clearBtn = (RECT){L.col[1].right - S(112), L.col[1].top + S(15), L.col[1].right - S(14), L.col[1].top + S(43)};
+  L.clearBtn = (RECT){L.col[2].right - S(104), L.col[2].top + S(15), L.col[2].right - S(14), L.col[2].top + S(43)};
   L.site = (RECT){M, H - S(34), M + S(360), H - S(10)};
   L.cardH = S(98); L.gap = S(10);
   build_lists();
-  for (int c = 0; c < 2; c++) {
+  for (int c = 0; c < 3; c++) {
     int content = L.cnt[c] * (L.cardH + L.gap) - L.gap, vis = L.area[c].bottom - L.area[c].top;
     int mx = content > vis ? content - vis : 0;
     if (g_scroll[c] > mx) g_scroll[c] = mx;
@@ -316,6 +320,7 @@ static RECT card_rect(int c, int k) {
 }
 static RECT card_b1(RECT r) { int s = S(30); return (RECT){r.right - S(14) - s, r.top + S(14), r.right - S(14), r.top + S(14) + s}; }
 static RECT card_b2(RECT r) { RECT b = card_b1(r); int s = S(30) + S(8); b.left -= s; b.right -= s; return b; }
+static RECT card_b3(RECT r) { RECT b = card_b2(r); int s = S(30) + S(8); b.left -= s; b.right -= s; return b; }
 static int in_rect(RECT r, int x, int y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 
 static Hit hit_test(int x, int y) {
@@ -323,9 +328,9 @@ static Hit hit_test(int x, int y) {
   if (in_rect(L.addBtn, x, y)) { h.kind = H_ADD; return h; }
   if (in_rect(L.bindsBtn, x, y)) { h.kind = H_BINDS; return h; }
   if (in_rect(L.remindBtn, x, y)) { h.kind = H_REMIND; return h; }
-  if (L.cnt[1] && in_rect(L.clearBtn, x, y)) { h.kind = H_CLEAR; return h; }
+  if (L.cnt[2] && in_rect(L.clearBtn, x, y)) { h.kind = H_CLEAR; return h; }
   if (in_rect(L.site, x, y)) { h.kind = H_SITE; return h; }
-  for (int c = 0; c < 2; c++) {
+  for (int c = 0; c < 3; c++) {
     if (!in_rect(L.area[c], x, y)) continue;
     for (int k = 0; k < L.cnt[c]; k++) {
       RECT r = card_rect(c, k);
@@ -333,6 +338,7 @@ static Hit hit_test(int x, int y) {
       h.idx = L.idx[c][k];
       if (in_rect(card_b1(r), x, y)) h.kind = H_CARD_B1;
       else if (in_rect(card_b2(r), x, y)) h.kind = H_CARD_B2;
+      else if (T[h.idx].status != 1 && in_rect(card_b3(r), x, y)) h.kind = H_CARD_B3;
       else h.kind = H_CARD;
       return h;
     }
@@ -354,60 +360,81 @@ static void draw_back(HDC dc, RECT b, COLORREF c) {
   line(dc, cx + S(6), cy, cx - S(6), cy, w, c); line(dc, cx - S(6), cy, cx - S(2), cy - S(4), w, c); line(dc, cx - S(6), cy, cx - S(2), cy + S(4), w, c);
 }
 
+static void draw_q(HDC dc, RECT b, COLORREF c) { text(dc, L"?", fH, c, b.left, b.top, b.right, b.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER); }
+static void fmt_wait(DWORD sec, WCHAR *out) {
+  DWORD m = sec / 60, h = m / 60;
+  if (h) wsprintfW(out, L"%lu ч %lu мин", h, m % 60); else wsprintfW(out, L"%lu мин", m);
+}
+
 static void draw_card(HDC dc, RECT r, int i, int hover, int hb, int ghost) {
   Ticket *t = &T[i];
-  int work = t->status == 0;
+  int work = t->status == 0, wait = t->status == 2;
   COLORREF fill = ghost ? C_CARD_H : (hover ? C_CARD_H : C_CARD);
   COLORREF br = ghost ? C_ACC : (hover ? RGB(70, 69, 78) : C_CARD_BR);
   rrect(dc, r.left, r.top, r.right, r.bottom, S(14), fill, 1, br);
   /* полоска-индикатор слева */
   int pv = pulse(1400);
-  COLORREF bar = work ? mix(C_ACC, C_ACC2, pv, 700) : C_GREEN;
+  COLORREF bar = work ? mix(C_ACC, C_ACC2, pv, 700) : wait ? C_AMB : C_GREEN;
   rrect(dc, r.left + S(7), r.top + S(14), r.left + S(11), r.bottom - S(14), S(4), bar, 0, 0);
 
   int x = r.left + S(24);
-  RECT b1 = card_b1(r), b2 = card_b2(r);
-  text(dc, t->num, fNum, C_TEXT, x, r.top + S(10), b2.left - S(8), r.top + S(46), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+  RECT b1 = card_b1(r), b2 = card_b2(r), b3 = card_b3(r);
+  int numRight = (t->status == 1 ? b2.left : b3.left) - S(8);
+  text(dc, t->num, fNum, C_TEXT, x, r.top + S(10), numRight, r.top + S(46), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
   WCHAR sub[200], tm[32], buf[80];
-  if (t->note[0]) wcopy(sub, t->note, 200); else wcopy(sub, work ? L"без описания" : L"", 200);
+  if (t->note[0]) wcopy(sub, t->note, 200); else wcopy(sub, t->status == 1 ? L"" : L"без описания", 200);
   /* таймер-пилюля справа внизу */
   fmt_dur(tk_elapsed(t), tm);
-  int tw = text_w(dc, tm, fMono) + S(work ? 34 : 22);
+  int tw = text_w(dc, tm, fMono) + S(t->status == 1 ? 22 : 34);
   RECT pill = {r.right - S(14) - tw, r.bottom - S(14) - S(28), r.right - S(14), r.bottom - S(14)};
+  int cy = (pill.top + pill.bottom) / 2;
   if (work) {
     COLORREF pb = mix(RGB(0, 90, 145), C_ACC, pv, 700);
     rrect(dc, pill.left, pill.top, pill.right, pill.bottom, S(26), RGB(14, 32, 46), 1, pb);
-    int cx = pill.left + S(14), cy = (pill.top + pill.bottom) / 2;
+    int cx = pill.left + S(14);
     circle(dc, cx, cy, S(3) + pv * S(3) / 700, mix(RGB(14, 32, 46), RGB(0, 110, 170), 700 - pv, 700));
     circle(dc, cx, cy, S(3), C_ACC);
     text(dc, tm, fMono, C_TEXT, pill.left + S(24), pill.top, pill.right - S(8), pill.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+  } else if (wait) {
+    rrect(dc, pill.left, pill.top, pill.right, pill.bottom, S(26), RGB(42, 31, 14), 1, RGB(140, 100, 40));
+    int cx = pill.left + S(14);
+    rrect(dc, cx - S(4), cy - S(5), cx - S(2), cy + S(5), 0, C_AMB, 0, 0);
+    rrect(dc, cx + S(1), cy - S(5), cx + S(3), cy + S(5), 0, C_AMB, 0, 0);
+    text(dc, tm, fMono, RGB(235, 225, 210), pill.left + S(24), pill.top, pill.right - S(8), pill.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
   } else {
     rrect(dc, pill.left, pill.top, pill.right, pill.bottom, S(26), RGB(36, 35, 40), 1, RGB(58, 57, 64));
     text(dc, tm, fMono, C_MUTED, pill.left, pill.top, pill.right, pill.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
   }
   /* нижняя строка: описание + время */
   WCHAR clk[16];
-  if (work) { fmt_clock(t->created, clk); wsprintfW(buf, L"взята в %s", clk); }
-  else { fmt_clock(t->doneAt, clk); wsprintfW(buf, L"выполнена в %s", clk); }
+  COLORREF bc;
+  if (work) { fmt_clock(t->created, clk); wsprintfW(buf, L"взята в %s", clk); bc = C_DIM; }
+  else if (wait) { DWORD n = now_unix(); WCHAR wt[32]; fmt_wait(n > t->runStart ? n - t->runStart : 0, wt); wsprintfW(buf, L"ждёт %s", wt); bc = RGB(200, 150, 70); }
+  else { fmt_clock(t->doneAt, clk); wsprintfW(buf, L"выполнена в %s", clk); bc = RGB(80, 190, 165); }
   int bw = text_w(dc, buf, fSmall);
   int bx = pill.left - S(12) - bw;
   if (bx < x + S(40)) bx = x + S(40);
-  text(dc, buf, fSmall, work ? C_DIM : RGB(80, 190, 165), bx, pill.top, pill.left - S(10), pill.bottom, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
+  text(dc, buf, fSmall, bc, bx, pill.top, pill.left - S(10), pill.bottom, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
   if (sub[0]) text(dc, sub, fText, t->note[0] ? C_MUTED : C_DIM, x, pill.top, bx - S(10), pill.bottom, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
-  /* кнопки */
+  /* кнопки: b1 — удалить; b2 — выполнено (или «вернуть» у выполненных); b3 — на уточнение / в работу */
   if (!ghost) {
-    COLORREF b1c = hb == 1 ? RGB(70, 30, 40) : RGB(40, 39, 45), b2c;
-    rrect(dc, b1.left, b1.top, b1.right, b1.bottom, S(10), b1c, 0, 0);
+    rrect(dc, b1.left, b1.top, b1.right, b1.bottom, S(10), hb == 1 ? RGB(70, 30, 40) : RGB(40, 39, 45), 0, 0);
     draw_x(dc, b1, hb == 1 ? C_RED : C_MUTED);
-    if (work) {
+    if (t->status == 1) {
+      rrect(dc, b2.left, b2.top, b2.right, b2.bottom, S(10), hb == 2 ? RGB(52, 51, 60) : RGB(40, 39, 45), 0, 0);
+      draw_back(dc, b2, hb == 2 ? C_TEXT : C_MUTED);
+    } else {
       if (hb == 2) grad_rr(dc, b2.left, b2.top, b2.right, b2.bottom, S(10), C_ACC, C_ACC2);
       else rrect(dc, b2.left, b2.top, b2.right, b2.bottom, S(10), RGB(20, 52, 72), 0, 0);
       draw_check(dc, b2, hb == 2 ? C_TEXT : C_SEC);
-    } else {
-      b2c = hb == 2 ? RGB(52, 51, 60) : RGB(40, 39, 45);
-      rrect(dc, b2.left, b2.top, b2.right, b2.bottom, S(10), b2c, 0, 0);
-      draw_back(dc, b2, hb == 2 ? C_TEXT : C_MUTED);
+      if (work) {
+        rrect(dc, b3.left, b3.top, b3.right, b3.bottom, S(10), hb == 3 ? RGB(90, 62, 20) : RGB(52, 40, 22), 0, 0);
+        draw_q(dc, b3, hb == 3 ? C_TEXT : C_AMB);
+      } else {
+        rrect(dc, b3.left, b3.top, b3.right, b3.bottom, S(10), hb == 3 ? RGB(52, 51, 60) : RGB(40, 39, 45), 0, 0);
+        draw_back(dc, b3, hb == 3 ? C_TEXT : C_MUTED);
+      }
     }
   }
 }
@@ -484,23 +511,23 @@ static void paint(HWND h) {
   text(dc, L"В РАБОТУ  →", fBtn, C_TEXT, ab.left, ab.top, ab.right, ab.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
 
   /* колонки */
-  const WCHAR *titles[2] = {L"ЗАЯВКИ В РАБОТЕ", L"ВЫПОЛНЕНЫ"};
+  const WCHAR *titles[3] = {L"ЗАЯВКИ В РАБОТЕ", L"НА УТОЧНЕНИИ", L"ВЫПОЛНЕНЫ"};
   int pv = pulse(1400);
-  for (int c = 0; c < 2; c++) {
+  for (int c = 0; c < 3; c++) {
     RECT col = L.col[c];
-    int dropHere = g_dragging && T[g_dragIdx].status != c && in_rect(col, g_mouse.x, g_mouse.y);
+    int dropHere = g_dragging && col_of(T[g_dragIdx].status) != c && in_rect(col, g_mouse.x, g_mouse.y);
     rrect(dc, col.left, col.top, col.right, col.bottom, S(18), C_PANEL, 1, dropHere ? C_ACC : C_PANEL_BR);
     int hx = col.left + S(20), hy = col.top + S(29);
     if (c == 0) { circle(dc, hx + S(4), hy, S(4) + (L.cnt[0] ? pv * S(3) / 700 : 0), mix(C_PANEL, RGB(0, 90, 140), L.cnt[0] ? 700 - pv : 0, 700)); circle(dc, hx + S(4), hy, S(4), L.cnt[0] ? C_ACC : C_DIM); }
-    else circle(dc, hx + S(4), hy, S(4), C_GREEN);
-    text(dc, titles[c], fH, C_TEXT, hx + S(18), col.top + S(12), col.right - S(130), col.top + S(46), DT_SINGLELINE | DT_VCENTER);
+    else circle(dc, hx + S(4), hy, S(4), c == 1 ? C_AMB : C_GREEN);
+    text(dc, titles[c], fH, C_TEXT, hx + S(18), col.top + S(12), col.right - S(14), col.top + S(46), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     int ttw = text_w(dc, titles[c], fH);
     WCHAR cnt[16]; wsprintfW(cnt, L"%d", L.cnt[c]);
     int cwid = text_w(dc, cnt, fSmall) + S(18);
     RECT cp = {hx + S(18) + ttw + S(10), col.top + S(18), hx + S(18) + ttw + S(10) + cwid, col.top + S(40)};
-    rrect(dc, cp.left, cp.top, cp.right, cp.bottom, S(22), c == 0 ? RGB(14, 40, 58) : RGB(18, 48, 44), 0, 0);
-    text(dc, cnt, fSmall, c == 0 ? C_SEC : C_GREEN, cp.left, cp.top, cp.right, cp.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-    if (c == 1 && L.cnt[1]) {
+    rrect(dc, cp.left, cp.top, cp.right, cp.bottom, S(22), c == 0 ? RGB(14, 40, 58) : c == 1 ? RGB(56, 40, 16) : RGB(18, 48, 44), 0, 0);
+    text(dc, cnt, fSmall, c == 0 ? C_SEC : c == 1 ? C_AMB : C_GREEN, cp.left, cp.top, cp.right, cp.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    if (c == 2 && L.cnt[2]) {
       RECT cb = L.clearBtn;
       rrect(dc, cb.left, cb.top, cb.right, cb.bottom, S(28), g_hover.kind == H_CLEAR ? RGB(48, 30, 36) : RGB(30, 29, 34), 1, g_hover.kind == H_CLEAR ? RGB(120, 60, 70) : RGB(55, 54, 60));
       text(dc, L"очистить", fSmall, g_hover.kind == H_CLEAR ? C_RED : C_MUTED, cb.left, cb.top, cb.right, cb.bottom, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
@@ -510,7 +537,9 @@ static void paint(HWND h) {
     RECT a = L.area[c];
     IntersectClipRect(dc, a.left - 2, a.top, a.right + 2, a.bottom);
     if (!L.cnt[c]) {
-      const WCHAR *e = c == 0 ? L"Нет заявок в работе.\nВпиши номер сверху и нажми Enter." : L"Сюда попадут выполненные заявки.\nНажми галочку на карточке или перетащи её сюда.\nДвойной клик по карточке — изменить.";
+      const WCHAR *e = c == 0 ? L"Нет заявок в работе.\nВпиши номер сверху и нажми Enter.\nДвойной клик по карточке — изменить."
+                     : c == 1 ? L"Заявки, по которым ждёшь ответа.\nКнопка «?» на карточке — сюда.\nТаймер работы здесь на паузе."
+                              : L"Сюда попадут выполненные заявки.\nНажми галочку на карточке\nили перетащи её сюда.";
       text(dc, e, fText, C_DIM, a.left + S(10), a.top + S(40), a.right - S(10), a.top + S(120), DT_CENTER | DT_WORDBREAK);
     }
     for (int k = 0; k < L.cnt[c]; k++) {
@@ -518,8 +547,8 @@ static void paint(HWND h) {
       if (r.bottom < a.top || r.top > a.bottom) continue;
       int i = L.idx[c][k];
       if (g_dragging && i == g_dragIdx) { rrect(dc, r.left, r.top, r.right, r.bottom, S(14), C_PANEL, 1, RGB(55, 54, 62)); continue; }
-      int hv = (g_hover.idx == i && g_hover.kind >= H_CARD && g_hover.kind <= H_CARD_B2);
-      int hb = !hv ? 0 : g_hover.kind == H_CARD_B1 ? 1 : g_hover.kind == H_CARD_B2 ? 2 : 0;
+      int hv = (g_hover.idx == i && g_hover.kind >= H_CARD && g_hover.kind <= H_CARD_B3);
+      int hb = !hv ? 0 : g_hover.kind == H_CARD_B1 ? 1 : g_hover.kind == H_CARD_B2 ? 2 : g_hover.kind == H_CARD_B3 ? 3 : 0;
       draw_card(dc, r, i, hv, hb, 0);
     }
     /* полоса прокрутки */
@@ -544,9 +573,9 @@ static void paint(HWND h) {
   if (g_toast[0] && GetTickCount() < g_toastUntil) {
     text(dc, g_toast, fSmall, C_SEC, W / 2 - S(200), st.top, W - M, st.bottom, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
   } else {
-    DWORD total = 0; for (int k = 0; k < L.cnt[1]; k++) total += T[L.idx[1][k]].elapsed;
+    DWORD total = 0; for (int k = 0; k < L.cnt[2]; k++) total += T[L.idx[2][k]].elapsed;
     WCHAR d[32]; fmt_dur(total, d);
-    wsprintfW(foot, L"в работе: %d   ·   выполнено: %d   ·   время по выполненным: %s   ·   бинды: %d/12", L.cnt[0], L.cnt[1], d, g_hkOk);
+    wsprintfW(foot, L"в работе: %d   ·   на уточнении: %d   ·   выполнено: %d   ·   время по выполненным: %s", L.cnt[0], L.cnt[1], L.cnt[2], d);
     text(dc, foot, fSmall, C_DIM, W / 2 - S(200), st.top, W - M, st.bottom, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
   }
 
@@ -575,9 +604,8 @@ static void act_add(void) {
   if (i >= 0) {
     if (T[i].status == 0) { wsprintfW(msg, L"Заявка %s уже в работе", num); toast(msg); }
     else {
-      T[i].status = 0; T[i].runStart = now; T[i].order = ++SEQ;
       if (note[0]) wcopy(T[i].note, note, 120);
-      wsprintfW(msg, L"Заявка %s снова в работе — таймер продолжен", num); toast(msg);
+      set_status(i, 0);
     }
   } else {
     if (NT >= MAXT) { toast(L"Слишком много заявок — очисти выполненные"); return; }
@@ -590,20 +618,25 @@ static void act_add(void) {
   SetWindowTextW(g_eNum, L""); SetWindowTextW(g_eNote, L""); SetFocus(g_eNum);
   save_data(); InvalidateRect(g_wnd, NULL, 0);
 }
-static void act_done(int i) {
-  if (T[i].status) return;
+static void set_status(int i, int st) {
+  Ticket *t = &T[i];
+  if (t->status == st) return;
   DWORD now = now_unix();
-  T[i].elapsed = tk_elapsed(&T[i]); T[i].status = 1; T[i].doneAt = now; T[i].order = ++SEQ;
-  g_scroll[1] = 0;
-  WCHAR m[120], d[32]; fmt_dur(T[i].elapsed, d); wsprintfW(m, L"Заявка %s выполнена за %s", T[i].num, d); toast(m);
+  if (t->status == 0) t->elapsed = tk_elapsed(t);   /* остановили таймер работы */
+  t->status = st; t->order = ++SEQ;
+  if (st == 0 || st == 2) t->runStart = now;        /* старт работы / начало ожидания */
+  else t->doneAt = now;
+  g_scroll[col_of(st)] = 0;
+  WCHAR m[140], d[32];
+  if (st == 1) { fmt_dur(t->elapsed, d); wsprintfW(m, L"Заявка %s выполнена за %s", t->num, d); }
+  else if (st == 2) wsprintfW(m, L"Заявка %s на уточнении — таймер на паузе", t->num);
+  else wsprintfW(m, L"Заявка %s в работе — таймер продолжен", t->num);
+  toast(m);
   save_data(); InvalidateRect(g_wnd, NULL, 0);
 }
-static void act_return(int i) {
-  if (!T[i].status) return;
-  T[i].status = 0; T[i].runStart = now_unix(); T[i].order = ++SEQ; g_scroll[0] = 0;
-  WCHAR m[120]; wsprintfW(m, L"Заявка %s возвращена в работу", T[i].num); toast(m);
-  save_data(); InvalidateRect(g_wnd, NULL, 0);
-}
+static void act_done(int i) { set_status(i, 1); }
+static void act_return(int i) { set_status(i, 0); }
+static void act_wait(int i) { set_status(i, 2); }
 static void remove_at(int i) {
   if (g_ew) edit_close(); for (int k = i; k < NT - 1; k++) T[k] = T[k + 1]; NT--; }
 static void act_delete(int i) {
@@ -613,20 +646,20 @@ static void act_delete(int i) {
 }
 static void act_clear(void) {
   build_lists();
-  if (!L.cnt[1]) return;
-  WCHAR m[200]; wsprintfW(m, L"Убрать %d выполненных заявок из списка?\nОни сохранятся в файле rtbind_history.txt.", L.cnt[1]);
+  if (!L.cnt[2]) return;
+  WCHAR m[200]; wsprintfW(m, L"Убрать %d выполненных заявок из списка?\nОни сохранятся в файле rtbind_history.txt.", L.cnt[2]);
   if (MessageBoxW(g_wnd, m, L"BINDER", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
   WCHAR ln[400], d[32], c1[16], c2[16]; SYSTEMTIME st;
   SB[0] = 0;
   for (int i = 0; i < NT; i++) {
-    if (!T[i].status) continue;
+    if (T[i].status != 1) continue;
     unix_local(T[i].doneAt, &st); fmt_dur(T[i].elapsed, d); fmt_clock(T[i].created, c1); fmt_clock(T[i].doneAt, c2);
     wsprintfW(ln, L"%02d.%02d.%04d | %s | взята %s | выполнена %s | время %s | %s\r\n", st.wDay, st.wMonth, st.wYear, T[i].num, c1, c2, d, T[i].note);
     wcat(SB, ln, sizeof(SB) / 2);
   }
   write_utf8(g_hist, SB, 1);
-  for (int i = NT - 1; i >= 0; i--) if (T[i].status) remove_at(i);
-  g_scroll[1] = 0; save_data(); toast(L"Выполненные заявки перенесены в историю"); InvalidateRect(g_wnd, NULL, 0);
+  for (int i = NT - 1; i >= 0; i--) if (T[i].status == 1) remove_at(i);
+  g_scroll[2] = 0; save_data(); toast(L"Выполненные заявки перенесены в историю"); InvalidateRect(g_wnd, NULL, 0);
 }
 static void copy_text(const WCHAR *s) {
   int n = wlen(s);
@@ -951,7 +984,8 @@ static void show_reminder(int test) {
   rem_close();
   build_lists();
   g_rwTest = test; g_rwHover = 0;
-  int rows = L.cnt[0] > 6 ? 7 : L.cnt[0];
+  int open = L.cnt[0] + L.cnt[1];
+  int rows = open > 6 ? 7 : open;
   if (!rows) rows = 1;
   int w = S(440), hh = S(112) + rows * S(30) + S(84);
   RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
@@ -965,7 +999,7 @@ static void show_reminder(int test) {
 static void remind_tick(void) {
   if (g_snoozeUntil && now_unix() >= g_snoozeUntil) {
     g_snoozeUntil = 0; build_lists();
-    if (L.cnt[0]) show_reminder(0);
+    if (L.cnt[0] + L.cnt[1]) show_reminder(0);
     return;
   }
   if (!g_remOn) return;
@@ -977,7 +1011,7 @@ static void remind_tick(void) {
     int diff = (st.wHour * 60 + st.wMinute) - (g_remH * 60 + g_remM);
     g_remLastDay = day; save_settings();
     build_lists();
-    if (diff <= 120 && L.cnt[0]) show_reminder(0);
+    if (diff <= 120 && L.cnt[0] + L.cnt[1]) show_reminder(0);
   }
 }
 
@@ -1005,21 +1039,25 @@ static LRESULT WINAPI RemProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     text(dc, L"НАПОМИНАНИЕ", fH, C_TEXT, tx, S(16), rc.right - S(50), S(46), DT_SINGLELINE | DT_VCENTER);
     WCHAR b[160];
-    if (L.cnt[0]) wsprintfW(b, L"Скоро конец смены. В работе осталось заявок: %d", L.cnt[0]);
-    else wsprintfW(b, L"Заявок в работе нет — всё закрыто. Так держать!");
+    if (L.cnt[0] && L.cnt[1]) wsprintfW(b, L"Скоро конец смены. В работе: %d, на уточнении: %d", L.cnt[0], L.cnt[1]);
+    else if (L.cnt[0]) wsprintfW(b, L"Скоро конец смены. В работе осталось заявок: %d", L.cnt[0]);
+    else if (L.cnt[1]) wsprintfW(b, L"Скоро конец смены. На уточнении заявок: %d", L.cnt[1]);
+    else wsprintfW(b, L"Незакрытых заявок нет — всё сделано. Так держать!");
     text(dc, b, fText, C_MUTED, M, S(54), rc.right - M, S(80), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     int y = S(92);
-    for (int k = 0; k < L.cnt[0] && k < 6; k++) {
-      Ticket *t = &T[L.idx[0][k]];
+    int open = L.cnt[0] + L.cnt[1];
+    for (int k = 0; k < open && k < 6; k++) {
+      int isWait = k >= L.cnt[0];
+      Ticket *t = &T[isWait ? L.idx[1][k - L.cnt[0]] : L.idx[0][k]];
       WCHAR d[32]; fmt_dur(tk_elapsed(t), d);
       rrect(dc, M, y, rc.right - M, y + S(26), S(10), C_CARD, 0, 0);
-      circle(dc, M + S(12), y + S(13), S(3), C_ACC);
+      circle(dc, M + S(12), y + S(13), S(3), isWait ? C_AMB : C_ACC);
       text(dc, t->num, fBtn, C_TEXT, M + S(24), y, M + S(150), y + S(26), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
       text(dc, t->note, fSmall, C_MUTED, M + S(150), y, rc.right - M - S(90), y + S(26), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-      text(dc, d, fMono, C_SEC, rc.right - M - S(90), y, rc.right - M - S(10), y + S(26), DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+      text(dc, d, fMono, isWait ? C_AMB : C_SEC, rc.right - M - S(90), y, rc.right - M - S(10), y + S(26), DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
       y += S(30);
     }
-    if (L.cnt[0] > 6) { wsprintfW(b, L"и ещё %d…", L.cnt[0] - 6); text(dc, b, fSmall, C_DIM, M, y, rc.right - M, y + S(26), DT_SINGLELINE | DT_VCENTER); }
+    if (open > 6) { wsprintfW(b, L"и ещё %d…", open - 6); text(dc, b, fSmall, C_DIM, M, y, rc.right - M, y + S(26), DT_SINGLELINE | DT_VCENTER); }
     g_rwOpen = (RECT){rc.right - M - S(150), rc.bottom - S(60), rc.right - M, rc.bottom - S(20)};
     g_rwSnooze = (RECT){g_rwOpen.left - S(12) - S(140), g_rwOpen.top, g_rwOpen.left - S(12), g_rwOpen.bottom};
     grad_rr(dc, g_rwOpen.left, g_rwOpen.top, g_rwOpen.right, g_rwOpen.bottom, S(40), g_rwHover == 2 ? C_SEC : C_ACC, C_ACC2);
@@ -1196,8 +1234,9 @@ static void open_settings(void) {
 
 static void context_menu(int i, int sx, int sy) {
   HMENU m = CreatePopupMenu();
-  if (T[i].status == 0) AppendMenuW(m, MF_STRING, 1, L"Выполнено");
-  else AppendMenuW(m, MF_STRING, 2, L"Вернуть в работу");
+  if (T[i].status != 0) AppendMenuW(m, MF_STRING, 2, L"Вернуть в работу");
+  if (T[i].status != 2) AppendMenuW(m, MF_STRING, 7, L"На уточнение");
+  if (T[i].status != 1) AppendMenuW(m, MF_STRING, 1, L"Выполнено");
   AppendMenuW(m, MF_STRING, 6, L"Изменить…");
   AppendMenuW(m, MF_STRING, 3, L"Копировать номер");
   AppendMenuW(m, MF_STRING, 4, L"Взять номер и описание в поля ввода");
@@ -1213,6 +1252,7 @@ static void context_menu(int i, int sx, int sy) {
   case 4: SetWindowTextW(g_eNum, T[i].num); SetWindowTextW(g_eNote, T[i].note); SetFocus(g_eNote); break;
   case 5: act_delete(i); break;
   case 6: open_edit(i); break;
+  case 7: act_wait(i); break;
   }
 }
 
@@ -1239,7 +1279,7 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   }
   case WM_SIZE: place_edits(); InvalidateRect(h, NULL, 0); return 0;
   case WM_SETFOCUS: SetFocus(g_eNum); return 0;
-  case WM_GETMINMAXINFO: ((MINMAXINFO *)l)->ptMinTrackSize.x = S(880); ((MINMAXINFO *)l)->ptMinTrackSize.y = S(620); return 0;
+  case WM_GETMINMAXINFO: ((MINMAXINFO *)l)->ptMinTrackSize.x = S(1000); ((MINMAXINFO *)l)->ptMinTrackSize.y = S(620); return 0;
   case WM_ERASEBKGND: return 1;
   case WM_PAINT: paint(h); return 0;
   case WM_TIMER:
@@ -1273,7 +1313,7 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       int dx = x - g_pressPt.x, dy = y - g_pressPt.y;
       if (dx * dx + dy * dy > S(6) * S(6)) {
         g_dragging = 1; g_dragIdx = g_press.idx;
-        int c = T[g_dragIdx].status;
+        int c = col_of(T[g_dragIdx].status);
         for (int k = 0; k < L.cnt[c]; k++) if (L.idx[c][k] == g_dragIdx) { RECT r = card_rect(c, k); g_dragDX = g_pressPt.x - r.left; g_dragDY = g_pressPt.y - r.top; }
       }
     }
@@ -1299,8 +1339,8 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (g_dragging) {
       g_dragging = 0;
       int i = g_dragIdx;
-      if (T[i].status == 0 && in_rect(L.col[1], x, y)) act_done(i);
-      else if (T[i].status == 1 && in_rect(L.col[0], x, y)) act_return(i);
+      for (int c = 0; c < 3; c++)
+        if (in_rect(L.col[c], x, y) && COL_ST[c] != T[i].status) { set_status(i, COL_ST[c]); break; }
       InvalidateRect(h, NULL, 0);
       return 0;
     }
@@ -1313,7 +1353,8 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case H_CLEAR: act_clear(); break;
     case H_SITE: ShellExecuteW(h, L"open", L"https://kondrashov-m.ru", NULL, NULL, SW_SHOWNORMAL); break;
     case H_CARD_B1: act_delete(ht.idx); break;
-    case H_CARD_B2: if (T[ht.idx].status == 0) act_done(ht.idx); else act_return(ht.idx); break;
+    case H_CARD_B2: if (T[ht.idx].status == 1) act_return(ht.idx); else act_done(ht.idx); break;
+    case H_CARD_B3: if (T[ht.idx].status == 0) act_wait(ht.idx); else act_return(ht.idx); break;
     }
     return 0;
   }
@@ -1325,7 +1366,7 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   case WM_MOUSEWHEEL: {
     POINT p = {GET_X(l), GET_Y(l)}; ScreenToClient(h, &p);
     int d = (short)HIWORD(w);
-    for (int c = 0; c < 2; c++) if (in_rect(L.col[c], p.x, p.y)) { g_scroll[c] -= d * S(70) / 120; do_layout(); InvalidateRect(h, NULL, 0); }
+    for (int c = 0; c < 3; c++) if (in_rect(L.col[c], p.x, p.y)) { g_scroll[c] -= d * S(70) / 120; do_layout(); InvalidateRect(h, NULL, 0); }
     return 0;
   }
   case WM_CLOSE:
@@ -1395,7 +1436,7 @@ void WINAPI Entry(void) {
   wc.lpfnWndProc = RemProc; wc.lpszClassName = L"RTBindRemind";
   RegisterClassExW(&wc);
 
-  int W = S(1080), H = S(800);
+  int W = S(1280), H = S(800);
   int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
   if (W > sw - 40) W = sw - 40;
   if (H > sh - 80) H = sh - 80;
